@@ -1,0 +1,16 @@
+# Block files larger than 100MB
+*.zip
+*.avi
+*.bag
+*.onnx
+*.json
+*.mp4
+
+# Block local environment/dependency folders
+node_modules/
+__pycache__/
+.env
+
+# Block operating system junk files
+.DS_Store
+Thumbs.db

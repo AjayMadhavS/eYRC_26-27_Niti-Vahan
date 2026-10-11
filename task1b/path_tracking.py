@@ -19,8 +19,8 @@
 *****************************************************************************************
 '''
 
-# Team ID:          < Team-ID >
-# Author List:      < Names of the team members who worked on this file, comma separated >
+# Team ID:          2182
+# Author List:      Ajay Madhav S, ManoSaran, Poorvi, Deepavarshini S
 # Filename:         path_tracking.py
 # Functions:        ackermann_wheel_angles, compute_steering
 
@@ -47,6 +47,9 @@ WHEEL_OFFSET = 0.0275       # O: distance between kingpin axis and wheel centre.
 ############### ADD YOUR IMPLEMENTATION HERE #################
 ##############################################################
 
+# Stanley Controller Tuning Gains
+STANLEY_K = 1.0       # Cross-track error gain. Adjust if vehicle overshoots or is slow to converge.
+STANLEY_KS = 0.1      # Softening constant to prevent division by zero at low speeds.
 
 def ackermann_wheel_angles(delta):
     '''
@@ -66,9 +69,19 @@ def ackermann_wheel_angles(delta):
     `left_wheel_angle`  : [ float ]  angle for the left front wheel, radians
     `right_wheel_angle` : [ float ]  angle for the right front wheel, radians
     '''
-
-    left_wheel_angle = 0
-    right_wheel_angle = 0
+    # Guardrail for straight driving to prevent division by zero
+    if delta == 0.0:
+        return 0.0, 0.0
+        
+    # Calculate the turning radius of the vehicle center
+    R = WHEELBASE / math.tan(delta)
+    
+    # Calculate the effective half-track width
+    d = (TRACK_WIDTH / 2.0) - WHEEL_OFFSET
+    
+    # Calculate individual wheel angles
+    left_wheel_angle = math.atan(WHEELBASE / (R - d))
+    right_wheel_angle = math.atan(WHEELBASE / (R + d))
 
     return left_wheel_angle, right_wheel_angle
 
@@ -99,18 +112,26 @@ def compute_steering(target_y, current_values):
     `steering` : [ float ]
         Steering angle in radians. Positive turns the vehicle left, which on
         this road means toward SMALLER y.
-
-    NOTE:
-    ---
-    While you are debugging, printing or plotting from in here is fine - do
-    whatever helps you see what your controller is doing.
-
-    Before you submit, take all of it back out. The submitted function must
-    ONLY compute and return the steering angle: no print(), no plotting, and
-    no commanding the simulator - the control loop below does all of that.
     '''
-
-    steering = 0
+    y = current_values["y"]
+    yaw = current_values["yaw"]
+    v = current_values["speed"]
+    
+    # 1. Heading error (psi_e)
+    # The road runs straight, so target heading is 0. Error is simply -yaw.
+    psi_e = -yaw
+    
+    # 2. Cross-track error (e)
+    # A positive error asks for a left turn (toward smaller y)
+    e = y - target_y
+    
+    # 3. Cross-track steering correction term
+    # Uses atan2 to safely handle all input ranges and saturates at 90 degrees
+    cross_track_term = math.atan2(STANLEY_K * e, STANLEY_KS + v)
+    
+    # 4. Compute final steering angle
+    steering = psi_e + cross_track_term
+    
     return steering
 
 
@@ -308,7 +329,7 @@ def main():
     args = parser.parse_args()
     schedule = parse_schedule(args.schedule) if args.schedule else None
 
-    from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+    from coppeliasim_zmqremoteapi_client import RemoteAPIClient # type: ignore
 
     sim = RemoteAPIClient().require("sim")
     sim.setStepping(True)

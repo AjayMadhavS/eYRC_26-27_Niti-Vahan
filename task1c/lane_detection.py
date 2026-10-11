@@ -23,7 +23,7 @@
 # Author List:      < Names of the team members who worked on this file, comma separated >
 # Filename:         lane_detection.py
 # Functions:        detect_lane
-# Global variables: < List any global variables you add, "None" if you add none >
+# Global variables: g_last_lane
 
 
 ####################### IMPORT MODULES #######################
@@ -52,55 +52,104 @@ def detect_lane(frame):
     ---
     Detect the lane in a single frame and report where the centre of the lane
     is, and which of the two lanes the vehicle is currently in.
-
-    Input Arguments:
-    ---
-    `frame` :   [ numpy.ndarray ]
-        A single BGR frame read from the video, of shape (height, width, 3).
-
-    Returns:
-    ---
-    `result` :  [ dict ]
-        {
-            "center_x" : int,   x-pixel of the lane centre in this frame,
-                                or -1 if the lane could not be found
-            "lane"     : str,   "left", "right" or "unknown"
-        }
-
-    Example call:
-    ---
-    result = detect_lane(frame)
-
-    COORDINATE SYSTEM:
-    ---
-    `center_x` is an absolute pixel column in the frame AS RECEIVED - the
-    dataset's own resolution, 640x480. It is compared against a ground truth
-    measured in those pixels, so it only means anything in them.
-
-    You may resize, crop or warp all you like inside this function, but scale
-    the answer back before returning it. A centre found in a 320x240 copy is
-    half the value it should be, and a centre read off a bird's-eye view is in
-    warped coordinates, not frame ones - map the point back through the inverse
-    of your transform. Do not re-encode or resize the clip files themselves.
-
-    NOTE:
-    ---
-    This function must ONLY compute and return the result.
-    Do not call cv2.imshow(), cv2.waitKey(), cv2.imwrite() or print() from
-    inside it. All visualisation and debugging output belongs outside this
-    function - see draw_overlay() and process_video() below.
     '''
+    global g_last_lane
+    global g_last_lane_age
 
-    center_x = -1
+    Y_EVAL = 360
+    LANE_WIDTH = 315
+    frame_height, frame_width = frame.shape[:2]
+    if frame_width < 2 or frame_height < 2:
+        return {"center_x": -1, "lane": LANE_UNKNOWN}
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    yellow_mask = cv2.inRange(
+        hsv, np.array([16, 85, 65]), np.array([40, 255, 255]))
+    white_mask = cv2.inRange(
+        hsv, np.array([0, 0, 170]), np.array([180, 75, 255]))
+
+    yellow = _estimate_lane_mark(yellow_mask, Y_EVAL, "yellow")
+    white = _estimate_lane_mark(white_mask, Y_EVAL, "white")
+    yellow_x = (yellow["x"] if yellow is not None
+                and yellow["confidence"] >= 0.10 else None)
+    white_x = (white["x"] if white is not None
+               and white["confidence"] >= 0.10 else None)
+
+    
     lane = LANE_UNKNOWN
 
-    #################### ADD YOUR CODE HERE ####################
-    # 1. Isolate the lane markings in `frame`
-    # 2. Work out which two markings bracket the vehicle
-    # 3. Compute the x-pixel of the lane centre   ->  center_x
-    # 4. Decide which lane the vehicle is in      ->  lane
-    ############################################################
+    if white_x is not None:
+        if yellow_x is not None:
+            pair_width = abs(white_x - yellow_x)
 
+            if 180 <= pair_width <= 560:
+                lane = (
+                    LANE_LEFT
+                    if yellow_x < white_x
+                    else LANE_RIGHT
+                )
+            else:
+                lane = (
+                    LANE_LEFT
+                    if white_x >= frame_width / 2.0
+                    else LANE_RIGHT
+                )
+        else:
+            lane = (
+                LANE_LEFT
+                if white_x >= frame_width / 2.0
+                else LANE_RIGHT
+            )
+
+    elif yellow_x is not None:
+        lane = (
+            LANE_LEFT
+            if yellow_x < frame_width / 2.0
+            else LANE_RIGHT
+        )
+
+    if lane in (LANE_LEFT, LANE_RIGHT):
+        g_last_lane = lane
+        g_last_lane_age = 0
+    else:
+        g_last_lane_age += 1
+        if (
+            g_last_lane_age <= 5
+            and g_last_lane in (LANE_LEFT, LANE_RIGHT)
+        ):
+            lane = g_last_lane
+
+
+    center_x = -1
+    if (lane == LANE_LEFT and yellow_x is not None and white_x is not None
+            and yellow_x < white_x):
+        width = white_x - yellow_x
+        if 180 <= width <= 560:
+            center_x = int(round((yellow_x + white_x) / 2.0))
+    elif (lane == LANE_RIGHT and yellow_x is not None and white_x is not None
+          and white_x < yellow_x):
+        width = yellow_x - white_x
+        if 180 <= width <= 560:
+            center_x = int(round((yellow_x + white_x) / 2.0))
+
+    if center_x < 0 and white_x is not None and lane in (LANE_LEFT, LANE_RIGHT):
+        offset = LANE_WIDTH / 2.0
+        estimate = white_x - offset if lane == LANE_LEFT else white_x + offset
+        if 0 <= estimate < frame_width:
+            center_x = int(round(estimate))
+
+    if center_x < 0 and yellow_x is not None and lane in (LANE_LEFT, LANE_RIGHT):
+        yellow_is_near_side = (
+            (lane == LANE_LEFT and yellow_x < frame_width / 2.0)
+            or (lane == LANE_RIGHT and yellow_x > frame_width / 2.0))
+        if yellow_is_near_side:
+            offset = LANE_WIDTH / 2.0
+            estimate = yellow_x + offset if lane == LANE_LEFT else yellow_x - offset
+            if 0 <= estimate < frame_width:
+                center_x = int(round(estimate))
+
+    if not 0 <= center_x < frame_width:
+        center_x = -1
     return {"center_x": center_x, "lane": lane}
 
 
@@ -111,6 +160,143 @@ def detect_lane(frame):
 # ever calls that one function. List them in the file header too.
 # ------------------------------------------------------------------
 
+# Lane state is retained only briefly while the dashed divider is not visible.
+g_last_lane = LANE_UNKNOWN
+g_last_lane_age = 100
+
+
+def _estimate_lane_mark(mask, target_y, colour):
+    height, width = mask.shape[:2]
+    roi_top = max(0, target_y - 105)
+    roi_bottom = min(height, target_y + 86)
+    if roi_bottom - roi_top < 20:
+        return None
+
+    roi = mask[roi_top:roi_bottom, :]
+    opened = cv2.morphologyEx(
+        roi, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8))
+    filtered = cv2.morphologyEx(
+        opened, cv2.MORPH_CLOSE, np.ones((9, 3), dtype=np.uint8))
+    contours, _ = cv2.findContours(
+        filtered, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    sample_y = []
+    sample_x = []
+    sample_support = []
+    for contour in contours:
+        x, y, box_width, box_height = cv2.boundingRect(contour)
+        contour_area = cv2.contourArea(contour)
+        direction_x, direction_y, _, _ = cv2.fitLine(
+            contour, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+        contour_points = contour.reshape(-1, 2).astype(np.float32)
+        normal_x, normal_y = -direction_y, direction_x
+        cross_track = contour_points[:, 0] * normal_x + contour_points[:, 1] * normal_y
+        contour_thickness = float(np.percentile(
+            np.abs(cross_track - np.median(cross_track)), 90) * 2.0)
+
+        # Lane paint is vertically elongated in this lower-road ROI. This
+        # rejects crosswalk bars and stop lines before fitting any positions.
+        if (box_height < 7 or abs(direction_y) < 0.12
+                or (colour == "white" and box_width > 90)
+                or contour_thickness > 105 or contour_area < 3):
+            continue
+
+        local_contour = contour.copy()
+        local_contour[:, 0, 0] -= x
+        local_contour[:, 0, 1] -= y
+        inside = np.zeros((box_height, box_width), dtype=np.uint8)
+        cv2.drawContours(inside, [local_contour], -1, 255, thickness=-1)
+        component = cv2.bitwise_and(
+            filtered[y:y + box_height, x:x + box_width], inside)
+        ys, xs = np.nonzero(component)
+        if len(xs) < (16 if colour == "white" else 14):
+            continue
+
+        max_band_width = 80 if colour == "yellow" else 38
+        for band in np.unique(ys // 6):
+            in_band = (ys // 6) == band
+            band_x = xs[in_band]
+            if (len(band_x) < 2
+                    or np.percentile(band_x, 90)
+                    - np.percentile(band_x, 10) > max_band_width):
+                continue
+            sample_y.append(roi_top + y + float(np.median(ys[in_band])))
+            sample_x.append(x + float(np.median(band_x)))
+            sample_support.append(len(band_x))
+
+    if len(sample_y) < 3:
+        return None
+
+    ys = np.asarray(sample_y, dtype=np.float64)
+    xs = np.asarray(sample_x, dtype=np.float64)
+    support = np.asarray(sample_support, dtype=np.float64)
+    near_target = np.abs(ys - target_y) <= 82
+    ys = ys[near_target]
+    xs = xs[near_target]
+    support = support[near_target]
+    accepted_pixels = int(np.sum(support))
+    if len(ys) < 3:
+        return None
+
+    y_delta = ys[:, None] - ys[None, :]
+    x_delta = xs[:, None] - xs[None, :]
+    pair_mask = (np.abs(y_delta) >= 8) & (np.abs(y_delta) <= 150)
+    slopes = x_delta[pair_mask] / y_delta[pair_mask]
+    if slopes.size == 0:
+        return None
+
+    slope = float(np.median(slopes))
+    intercept = float(np.median(xs - slope * (ys - target_y)))
+    residual = xs - (slope * (ys - target_y) + intercept)
+    residual_center = float(np.median(residual))
+    mad = float(np.median(np.abs(residual - residual_center)))
+    tolerance = max(9.0, min(22.0, 2.8 * 1.4826 * mad))
+    inliers = np.abs(residual - residual_center) <= tolerance
+    if np.count_nonzero(inliers) < 3:
+        return None
+
+    fit_y = ys[inliers]
+    fit_x = xs[inliers]
+    fit_support = support[inliers]
+    degree = 2 if len(fit_y) >= 6 and np.ptp(fit_y) >= 42 else 1
+    fit_weights = np.sqrt(fit_support) / (
+        1.0 + np.abs(fit_y - target_y) / 90.0)
+    coefficients = np.polyfit(
+        (fit_y - target_y) / 100.0, fit_x, degree, w=fit_weights)
+    for _ in range(2):
+        fit_residual = fit_x - np.polyval(
+            coefficients, (fit_y - target_y) / 100.0)
+        fit_median = float(np.median(fit_residual))
+        fit_mad = float(np.median(np.abs(fit_residual - fit_median)))
+        keep = np.abs(fit_residual - fit_median) <= max(7.0, 2.8 * fit_mad)
+        if np.count_nonzero(keep) < max(3, degree + 1):
+            break
+        fit_y = fit_y[keep]
+        fit_x = fit_x[keep]
+        fit_support = fit_support[keep]
+        degree = 2 if len(fit_y) >= 6 and np.ptp(fit_y) >= 42 else 1
+        fit_weights = np.sqrt(fit_support) / (
+            1.0 + np.abs(fit_y - target_y) / 90.0)
+        coefficients = np.polyfit(
+            (fit_y - target_y) / 100.0, fit_x, degree,
+            w=fit_weights)
+
+    estimate = float(np.polyval(coefficients, 0.0))
+    support_span = float(np.ptp(fit_y))
+    nearest_support = float(np.min(np.abs(fit_y - target_y)))
+    required_pixels = 26 if colour == "white" else 20
+    required_span = 18 if colour == "white" else 16
+    plausible_x = (0 <= estimate < width if colour == "white"
+                   else -80 <= estimate <= width + 80)
+    if (accepted_pixels < required_pixels or len(fit_y) < 3
+            or support_span < required_span or nearest_support > 58
+            or not plausible_x):
+        return None
+
+    confidence = min(1.0, accepted_pixels / 70.0)
+    confidence *= min(1.0, support_span / 50.0)
+    return {"x": estimate, "confidence": confidence,
+            "support": accepted_pixels, "span": support_span}
 
 ##############################################################
 ################ END OF YOUR IMPLEMENTATION ##################
@@ -129,12 +315,12 @@ def validate_result(result, frame_index):
 
     Input Arguments:
     ---
-    `result` :          [ object ]      whatever detect_lane() returned
-    `frame_index` :     [ int ]         index of the frame, used in error messages
+    result :          [ object ]      whatever detect_lane() returned
+    frame_index :     [ int ]         index of the frame, used in error messages
 
     Returns:
     ---
-    `clean` :           [ dict ]        {"center_x": int, "lane": str}
+    clean :           [ dict ]        {"center_x": int, "lane": str}
     '''
     where = "detect_lane() on frame {}".format(frame_index)
 
@@ -172,12 +358,12 @@ def draw_overlay(frame, result):
 
     Input Arguments:
     ---
-    `frame` :   [ numpy.ndarray ]   the frame that was passed to detect_lane()
-    `result` :  [ dict ]            the validated result for that frame
+    frame :   [ numpy.ndarray ]   the frame that was passed to detect_lane()
+    result :  [ dict ]            the validated result for that frame
 
     Returns:
     ---
-    `canvas` :  [ numpy.ndarray ]   a copy of the frame with the overlay drawn
+    canvas :  [ numpy.ndarray ]   a copy of the frame with the overlay drawn
     '''
     canvas = frame.copy()
     height, width = canvas.shape[:2]
@@ -204,12 +390,12 @@ def process_video(video_path, show=False):
 
     Input Arguments:
     ---
-    `video_path` :  [ str ]     path to the video file
-    `show` :        [ bool ]    if True, display the overlay while processing
+    video_path :  [ str ]     path to the video file
+    show :        [ bool ]    if True, display the overlay while processing
 
     Returns:
     ---
-    `results` :     [ list ]    one dict per frame:
+    results :     [ list ]    one dict per frame:
                                 {"frame": int, "center_x": int, "lane": str}
     '''
     if not os.path.isfile(video_path):
@@ -260,8 +446,8 @@ def summarise(video_path, results):
 
     Input Arguments:
     ---
-    `video_path` :  [ str ]     path to the video that was processed
-    `results` :     [ list ]    output of process_video()
+    video_path :  [ str ]     path to the video that was processed
+    results :     [ list ]    output of process_video()
 
     Returns:
     ---
@@ -286,18 +472,18 @@ def expand_videos(paths):
     FOLDER as well as individual files.
 
     A folder is the portable way to say "all the clips": Windows shells do not
-    expand `public/*.mp4` the way bash does - cmd and PowerShell hand the
+    expand public/*.mp4 the way bash does - cmd and PowerShell hand the
     pattern through verbatim and the script would look for a file literally
-    named "*.mp4". `python lane_detection.py public` behaves the same on every
+    named "*.mp4". python lane_detection.py public behaves the same on every
     platform.
 
     Input Arguments:
     ---
-    `paths` :   [ list ]    the raw command-line arguments
+    paths :   [ list ]    the raw command-line arguments
 
     Returns:
     ---
-    `videos` :  [ list ]    paths to individual video files, folders expanded
+    videos :  [ list ]    paths to individual video files, folders expanded
     '''
     videos = []
     for raw in paths:
